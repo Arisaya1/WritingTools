@@ -20,6 +20,9 @@ Key Components:
     • GeminiProvider – Uses Google’s Generative AI API (Gemini) to generate content.
     • OpenAICompatibleProvider – Connects to any OpenAI-compatible API (v1/chat/completions)
     • OllamaProvider – Connects to a locally running Ollama server (e.g. for llama.cpp)
+    • LMStudioProvider – Connects to LM Studio's local server (OpenAI-compatible, default port 1234)
+    • LlamaCppProvider – Launches and manages a bundled-free `llama-server` (llama.cpp) process itself,
+      so any GGUF model (including 1-bit models like Bonsai) can be run without any other app.
 
 Response Flow:
    • The main app calls get_response() with a system instruction and a prompt.
@@ -31,8 +34,18 @@ Response Flow:
 Note: Streaming has been fully removed throughout the code.
 """
 
+import atexit
 import base64
 import logging
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
 import webbrowser
 from abc import ABC, abstractmethod
 from typing import List
@@ -131,6 +144,41 @@ class TextSetting(AIProviderSetting):
 
     def get_value(self):
         return self.input.text()
+
+
+class FileSetting(TextSetting):
+    """
+    A text setting with a "Browse..." button that opens a native file picker.
+    The value is stored as a plain path string.
+    """
+    def __init__(self, name: str, display_name: str = None, default_value: str = None,
+                 description: str = None, file_filter: str = "All files (*)"):
+        super().__init__(name, display_name, default_value, description)
+        self.file_filter = file_filter
+
+    def render_to_layout(self, layout: QVBoxLayout):
+        super().render_to_layout(layout)
+        # TextSetting appended its row as the last item of the layout; add a browse button to it.
+        row_layout = layout.itemAt(layout.count() - 1).layout()
+        browse = QtWidgets.QPushButton("Browse...")
+        browse.setStyleSheet(f"""
+            font-size: 14px;
+            padding: 5px 10px;
+            background-color: {'#444' if colorMode=='dark' else 'white'};
+            color: {'#ffffff' if colorMode=='dark' else '#000000'};
+            border: 1px solid {'#666' if colorMode=='dark' else '#ccc'};
+        """)
+
+        def pick():
+            start = self.input.text().strip()
+            start_dir = os.path.dirname(start) if start and os.path.dirname(start) else ""
+            path, _selected = QtWidgets.QFileDialog.getOpenFileName(
+                browse, f"Select {self.display_name}", start_dir, self.file_filter)
+            if path:
+                self.input.setText(path)
+
+        browse.clicked.connect(pick)
+        row_layout.addWidget(browse)
 
 
 class DropdownSetting(AIProviderSetting):
@@ -642,3 +690,321 @@ class OllamaProvider(AIProvider):
 
     def cancel(self):
         self.close_requested = True
+
+
+# Matches a complete <think>...</think> reasoning block that some local models emit.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+class _LocalOpenAIStyleProvider(AIProvider):
+    """
+    Shared implementation for local providers that talk to an OpenAI-compatible
+    /v1/chat/completions endpoint (LM Studio, a managed llama.cpp server).
+
+    Subclasses set `self.client` in `after_load()` and implement `_prepare_request()`,
+    which returns the model name to use (and may start servers, resolve defaults, etc.).
+    """
+    # Extra JSON body fields sent with every request (subclasses may override).
+    extra_body = None
+
+    def _prepare_request(self) -> str:
+        raise NotImplementedError
+
+    def _friendly_error(self, error: Exception) -> str:
+        return f"An error occurred: {error}"
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        """Strip reasoning blocks so only the final answer replaces the user's text."""
+        return _THINK_BLOCK_RE.sub("", text or "").strip()
+
+    def get_response(self, system_instruction: str, prompt: str | list, return_response: bool = False) -> str:
+        self.close_requested = False
+
+        if isinstance(prompt, list):
+            messages = prompt
+        else:
+            messages = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt}
+            ]
+
+        try:
+            model = self._prepare_request()
+            kwargs = {}
+            if self.extra_body:
+                kwargs["extra_body"] = self.extra_body
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.5,
+                stream=False,
+                **kwargs
+            )
+            response_text = self._clean(response.choices[0].message.content)
+
+            if not return_response and not hasattr(self.app, 'current_response_window'):
+                self.app.output_ready_signal.emit(response_text)
+            return response_text
+
+        except Exception as e:
+            if self.close_requested:
+                # The user cancelled; don't pop up an error for it.
+                return ""
+            logging.error(f"Error while generating content with {self.provider_name}: {e}")
+            self.app.show_message_signal.emit("Error", self._friendly_error(e))
+            return ""
+
+    def before_load(self):
+        self.client = None
+
+    def cancel(self):
+        self.close_requested = True
+
+    def shutdown(self):
+        """Release external resources (child processes etc.) when the app exits."""
+        pass
+
+
+class LMStudioProvider(_LocalOpenAIStyleProvider):
+    """
+    Provider for LM Studio's local server (https://lmstudio.ai).
+
+    LM Studio exposes an OpenAI-compatible API (default http://localhost:1234/v1)
+    once you start its server (Developer tab → Start Server). If no model name is
+    given, the first model reported by the server is used.
+    """
+    def __init__(self, app):
+        self.close_requested = None
+        self.client = None
+
+        settings = [
+            TextSetting("api_base", "Server URL", "http://localhost:1234/v1", "E.g. http://localhost:1234/v1"),
+            TextSetting("api_model", "Model", "", "Leave blank to use the model loaded in LM Studio"),
+            TextSetting("api_key", "API Key", "lm-studio", "Only needed if you enabled auth in LM Studio"),
+        ]
+        super().__init__(app, "LM Studio (For Experts)", settings,
+            "• Connect to LM Studio's local server (OpenAI-compatible API).\n"
+            "• In LM Studio, open the Developer tab and click \"Start Server\".\n"
+            "• Leave Model blank to use whichever model is loaded.",
+            "lmstudio", "Get LM Studio", lambda: webbrowser.open("https://lmstudio.ai"))
+
+    def after_load(self):
+        self.client = OpenAI(
+            api_key=(self.api_key or "lm-studio"),
+            base_url=(self.api_base or "http://localhost:1234/v1").strip(),
+            timeout=600.0,
+        )
+
+    def _prepare_request(self) -> str:
+        model = (self.api_model or "").strip()
+        if model:
+            return model
+        # No model configured: use the first non-embedding model the server reports.
+        models = [m.id for m in self.client.models.list().data]
+        chat_models = [m for m in models if "embed" not in m.lower()]
+        if not chat_models:
+            raise RuntimeError("LM Studio reports no models. Load a model in LM Studio or set one in Settings.")
+        return chat_models[0]
+
+    def _friendly_error(self, error: Exception) -> str:
+        text = str(error)
+        if "Connection" in type(error).__name__ or "connect" in text.lower():
+            return ("Could not reach LM Studio. Make sure its server is running "
+                    f"(Developer tab → Start Server) and the URL is correct ({self.api_base}).")
+        return f"An error occurred: {text}"
+
+
+class LlamaCppProvider(_LocalOpenAIStyleProvider):
+    """
+    Runs models locally by launching and managing a llama.cpp `llama-server` process.
+
+    No other app (Ollama, LM Studio...) is needed: pick a `llama-server` binary and a
+    GGUF model file in Settings. The server is started on first use on a free local
+    port, reused for later requests, restarted if settings change, shut down after an
+    idle timeout (to free RAM/VRAM) and when Writing Tools exits.
+
+    1-bit / low-bit models (e.g. PrismML's Bonsai, quantized as Q1_0) work as long as
+    the `llama-server` build supports the model's quantization type. Recent upstream
+    llama.cpp does for Q1_0; PrismML also publishes known-good binaries.
+    """
+    HEALTH_TIMEOUT_SECONDS = 600  # Loading a big model from a slow disk can take minutes.
+
+    def __init__(self, app):
+        self.close_requested = None
+        self.client = None
+        self._lock = threading.RLock()
+        self._process = None
+        self._port = None
+        self._started_with = None
+        self._log_path = os.path.join(
+            os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp", "writingtools_llama_server.log")
+        self._idle_timer = None
+        self.extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+
+        settings = [
+            FileSetting("server_binary", "llama-server", "llama-server",
+                        "Path to llama-server, or just 'llama-server' if it is on your PATH",
+                        file_filter="All files (*)"),
+            FileSetting("model_path", "GGUF Model", "", "Path to a .gguf model file",
+                        file_filter="GGUF models (*.gguf);;All files (*)"),
+            TextSetting("context_size", "Context Size (tokens)", "8192", "E.g. 8192"),
+            TextSetting("gpu_layers", "GPU Layers", "99", "99 = offload everything, 0 = CPU only"),
+            TextSetting("idle_minutes", "Unload After Idle (minutes)", "10", "0 = keep loaded until the app exits"),
+            TextSetting("extra_args", "Extra Arguments", "", "Optional llama-server flags, e.g. --threads 8"),
+        ]
+        super().__init__(app, "Local llama.cpp (Built-in)", settings,
+            "• Runs GGUF models directly on your PC with llama.cpp. No other app needed.\n"
+            "• Point to a llama-server binary and a .gguf model file.\n"
+            "• Supports 1-bit models like Bonsai (Q1_0) when your llama-server build supports them.",
+            "llamacpp", "Get llama.cpp",
+            lambda: webbrowser.open("https://github.com/ggml-org/llama.cpp/releases"))
+        atexit.register(self.shutdown)
+
+    # -- configuration helpers ---------------------------------------------------
+
+    @staticmethod
+    def _int(value, default: int) -> int:
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _find_binary(self) -> str:
+        configured = (self.server_binary or "llama-server").strip().strip('"')
+        exe = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+        if os.path.isdir(configured):
+            candidate = os.path.join(configured, exe)
+            if os.path.isfile(candidate):
+                return candidate
+        elif os.path.isfile(configured):
+            return configured
+        found = shutil.which(configured)
+        if found:
+            return found
+        raise RuntimeError(
+            f"Could not find llama-server ('{configured}'). Download llama.cpp from "
+            "github.com/ggml-org/llama.cpp/releases, then set the llama-server path in Settings.")
+
+    def _build_command(self, port: int) -> list:
+        import shlex
+        model = (self.model_path or "").strip().strip('"')
+        if not model or not os.path.isfile(model):
+            raise RuntimeError("No valid GGUF model selected. Choose a .gguf file in Settings.")
+        cmd = [
+            self._find_binary(), "-m", model,
+            "--host", "127.0.0.1", "--port", str(port),
+            "-c", str(self._int(self.context_size, 8192)),
+            "-ngl", str(self._int(self.gpu_layers, 99)),
+        ]
+        cmd += shlex.split(self.extra_args or "", posix=(sys.platform != "win32"))
+        return cmd
+
+    def _settings_signature(self) -> tuple:
+        return (self.server_binary, self.model_path, self.context_size, self.gpu_layers, self.extra_args)
+
+    # -- server lifecycle --------------------------------------------------------
+
+    def _log_tail(self, lines: int = 8) -> str:
+        try:
+            with open(self._log_path, "r", errors="replace") as f:
+                return "".join(f.readlines()[-lines:]).strip()
+        except OSError:
+            return ""
+
+    def _wait_until_ready(self, process, port: int):
+        deadline = time.time() + self.HEALTH_TIMEOUT_SECONDS
+        url = f"http://127.0.0.1:{port}/health"
+        while time.time() < deadline:
+            if self.close_requested:
+                raise RuntimeError("Cancelled while the model was loading.")
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"llama-server exited while loading the model (code {process.returncode}). "
+                    f"Your llama-server build may not support this model's format.\n\n{self._log_tail()}")
+            try:
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        return
+            except Exception:
+                pass  # 503 while loading, or not listening yet
+            time.sleep(0.5)
+        raise RuntimeError("Timed out waiting for llama-server to load the model.")
+
+    def _start_server(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        cmd = self._build_command(port)
+        logging.info(f"Starting llama-server: {cmd}")
+
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        log = open(self._log_path, "w")
+        try:
+            process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kwargs)
+        finally:
+            log.close()
+        self._process, self._port = process, port
+        try:
+            self._wait_until_ready(process, port)
+        except Exception:
+            self._stop_server()
+            raise
+        self._started_with = self._settings_signature()
+        self.client = OpenAI(api_key="llama-cpp", base_url=f"http://127.0.0.1:{port}/v1", timeout=600.0)
+
+    def _stop_server(self):
+        with self._lock:
+            process, self._process = self._process, None
+            self._started_with = None
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def _schedule_idle_shutdown(self):
+        minutes = self._int(self.idle_minutes, 10)
+        if self._idle_timer:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+        if minutes > 0:
+            self._idle_timer = threading.Timer(minutes * 60, self._stop_server)
+            self._idle_timer.daemon = True
+            self._idle_timer.start()
+
+    # -- provider interface ------------------------------------------------------
+
+    def _prepare_request(self) -> str:
+        with self._lock:
+            alive = self._process is not None and self._process.poll() is None
+            if not alive or self._started_with != self._settings_signature():
+                self._stop_server()
+                self._start_server()
+            self._schedule_idle_shutdown()
+        # llama-server serves the one model it was started with; the name is informational.
+        return os.path.basename(self.model_path or "model")
+
+    def _friendly_error(self, error: Exception) -> str:
+        return str(error) if isinstance(error, RuntimeError) else f"An error occurred: {error}"
+
+    def after_load(self):
+        # Settings may have changed, so drop any running server; it restarts lazily on next use.
+        self._stop_server()
+        self.client = None
+
+    def before_load(self):
+        self._stop_server()
+        self.client = None
+
+    def cancel(self):
+        self.close_requested = True
+
+    def shutdown(self):
+        self._stop_server()
