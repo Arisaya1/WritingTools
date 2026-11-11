@@ -18,8 +18,9 @@ class UIUtils:
             if child.layout():
                 cls.clear_layout(child.layout())
                 child.layout().deleteLater()
-            else:
+            elif child.widget():
                 child.widget().deleteLater()
+            # Anything else (e.g. a spacer from addStretch()) has nothing to delete.
 
     @classmethod
     def resize_and_round_image(cls, image, image_size = 100, rounding_amount = 50):
