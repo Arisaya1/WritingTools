@@ -43,6 +43,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -51,6 +52,7 @@ from abc import ABC, abstractmethod
 from typing import List
 
 # External libraries
+import httpx
 from google import genai
 from google.genai import types as genai_types
 from ollama import Client as OllamaClient
@@ -713,6 +715,10 @@ class _LocalOpenAIStyleProvider(AIProvider):
     def _friendly_error(self, error: Exception) -> str:
         return f"An error occurred: {error}"
 
+    def _after_request(self):
+        """Called once a request finishes (successfully or not)."""
+        pass
+
     @staticmethod
     def _clean(text: str) -> str:
         """Strip reasoning blocks so only the final answer replaces the user's text."""
@@ -754,6 +760,8 @@ class _LocalOpenAIStyleProvider(AIProvider):
             logging.error(f"Error while generating content with {self.provider_name}: {e}")
             self.app.show_message_signal.emit("Error", self._friendly_error(e))
             return ""
+        finally:
+            self._after_request()
 
     def before_load(self):
         self.client = None
@@ -837,8 +845,7 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
         self._process = None
         self._port = None
         self._started_with = None
-        self._log_path = os.path.join(
-            os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp", "writingtools_llama_server.log")
+        self._log_path = os.path.join(tempfile.gettempdir(), "writingtools_llama_server.log")
         self._idle_timer = None
         self.extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
 
@@ -915,6 +922,8 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
     def _wait_until_ready(self, process, port: int):
         deadline = time.time() + self.HEALTH_TIMEOUT_SECONDS
         url = f"http://127.0.0.1:{port}/health"
+        # Never route the local health check through a system/env HTTP proxy.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         while time.time() < deadline:
             if self.close_requested:
                 raise RuntimeError("Cancelled while the model was loading.")
@@ -923,7 +932,7 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
                     f"llama-server exited while loading the model (code {process.returncode}). "
                     f"Your llama-server build may not support this model's format.\n\n{self._log_tail()}")
             try:
-                with urllib.request.urlopen(url, timeout=2) as resp:
+                with opener.open(url, timeout=2) as resp:
                     if resp.status == 200:
                         return
             except Exception:
@@ -953,7 +962,9 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
             self._stop_server()
             raise
         self._started_with = self._settings_signature()
-        self.client = OpenAI(api_key="llama-cpp", base_url=f"http://127.0.0.1:{port}/v1", timeout=600.0)
+        # The server is on loopback; don't let HTTP(S)_PROXY env vars intercept it.
+        self.client = OpenAI(api_key="llama-cpp", base_url=f"http://127.0.0.1:{port}/v1", timeout=600.0,
+                             http_client=httpx.Client(trust_env=False, timeout=600.0))
 
     def _stop_server(self):
         with self._lock:
@@ -969,12 +980,20 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
             except subprocess.TimeoutExpired:
                 process.kill()
 
+    def _cancel_idle_shutdown(self):
+        with self._lock:
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+
     def _schedule_idle_shutdown(self):
         minutes = self._int(self.idle_minutes, 10)
-        if self._idle_timer:
-            self._idle_timer.cancel()
-            self._idle_timer = None
-        if minutes > 0:
+        with self._lock:
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+            if minutes <= 0 or self._process is None:
+                return
             self._idle_timer = threading.Timer(minutes * 60, self._stop_server)
             self._idle_timer.daemon = True
             self._idle_timer.start()
@@ -987,17 +1006,27 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
             if not alive or self._started_with != self._settings_signature():
                 self._stop_server()
                 self._start_server()
-            self._schedule_idle_shutdown()
+            # Never unload the model while a request is in flight; the idle
+            # countdown restarts in _after_request() once it finishes.
+            self._cancel_idle_shutdown()
         # llama-server serves the one model it was started with; the name is informational.
         return os.path.basename(self.model_path or "model")
 
     def _friendly_error(self, error: Exception) -> str:
         return str(error) if isinstance(error, RuntimeError) else f"An error occurred: {error}"
 
+    def _after_request(self):
+        self._schedule_idle_shutdown()
+
     def after_load(self):
-        # Settings may have changed, so drop any running server; it restarts lazily on next use.
-        self._stop_server()
-        self.client = None
+        # Only drop a running server if its launch settings changed (saving unrelated
+        # settings shouldn't force a slow model reload); it restarts lazily on next use.
+        with self._lock:
+            if self._started_with is not None and self._started_with != self._settings_signature():
+                self._stop_server()
+                self.client = None
+            elif self._process is not None:
+                self._schedule_idle_shutdown()  # idle timeout may have changed
 
     def before_load(self):
         self._stop_server()
