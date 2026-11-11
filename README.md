@@ -206,6 +206,19 @@ These instructions are for any Writing Tools version, using the OpenAI-Compatibl
    - API Model: `llama3.1:8b`
 5. That's it! **Enjoy Writing Tools with _absolute_ privacy and no internet connection!** 🎉 From now on, you'll simply need to launch Ollama and Writing Tools into the background for it to work.
 
+## 🖥️ (Optional) LM Studio & Built-in llama.cpp (Windows/Linux)
+
+**LM Studio:**
+1. Install [LM Studio](https://lmstudio.ai), download a model, then open the **Developer** tab and click **Start Server**.
+2. In Writing Tools Settings, choose **LM Studio**. The default URL (`http://localhost:1234/v1`) works out of the box. Leave **Model** blank to use whichever model is loaded, or type a model name.
+
+**Built-in llama.cpp (no other app needed):**
+1. Download a `llama-server` build from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) (or build it yourself), and download any `.gguf` model.
+2. In Writing Tools Settings, choose **Local llama.cpp (Built-in)**, set the `llama-server` path (or leave it as `llama-server` if it's on your PATH), and pick your `.gguf` file with **Browse...**.
+3. Writing Tools starts the server for you on first use, keeps it loaded for the configured idle time (default 10 minutes), and shuts it down when you exit. Server output is logged to `writingtools_llama_server.log` in your temp folder. Use **Extra Arguments** for any other `llama-server` flags.
+
+**1-bit models (e.g. PrismML's Bonsai):** these work as long as your `llama-server` build supports the model's quantization. Per [PrismML's docs](https://docs.prismml.com/download/formats), 1-bit `Q1_0` is supported by recent upstream llama.cpp, and their [pre-built binaries](https://docs.prismml.com/run/llamacpp) are the known-good fallback (and may be required for other formats such as ternary `Q2_0`). If the model fails to load, check the log file above and try a newer or PrismML `llama-server` build.
+
 ## 🐞 Known Issues
 1. Some reported hotkey conflicts on the latest v9 build: will release a maintenance update when I get time!
 

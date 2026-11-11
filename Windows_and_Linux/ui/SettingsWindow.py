@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 
@@ -368,6 +369,15 @@ class SettingsWindow(QtWidgets.QWidget):
         self.app.providers[self.provider_dropdown.currentIndex()].save_config()
 
         provider_name = self.app.config.get('provider', 'Gemini')
+        previous_provider = getattr(self.app, 'current_provider', None)
+        if previous_provider is not None and previous_provider.provider_name != provider_name \
+                and hasattr(previous_provider, 'shutdown'):
+            # Switching away from a provider that owns a child process (e.g. the
+            # built-in llama.cpp server): free its RAM/VRAM right away.
+            try:
+                previous_provider.shutdown()
+            except Exception as e:
+                logging.warning(f'Error shutting down provider {previous_provider.provider_name}: {e}')
         self.app.current_provider = next(
             (provider for provider in self.app.providers if provider.provider_name == provider_name),
             self.app.providers[0]

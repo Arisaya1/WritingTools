@@ -14,7 +14,8 @@ import ui.CustomPopupWindow
 import ui.OnboardingWindow
 import ui.ResponseWindow
 import ui.SettingsWindow
-from aiprovider import GeminiProvider, OllamaProvider, OpenAICompatibleProvider, obfuscate_api_key
+from aiprovider import (GeminiProvider, LlamaCppProvider, LMStudioProvider, OllamaProvider,
+                        OpenAICompatibleProvider, obfuscate_api_key)
 from pynput import keyboard as pykeyboard
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QLocale, Signal, Slot
@@ -93,7 +94,8 @@ class WritingToolApp(QtWidgets.QApplication):
         self.setup_ctrl_c_listener()
 
         # Setup available AI providers
-        self.providers = [GeminiProvider(self), OpenAICompatibleProvider(self), OllamaProvider(self)]
+        self.providers = [GeminiProvider(self), OpenAICompatibleProvider(self), OllamaProvider(self),
+                          LMStudioProvider(self), LlamaCppProvider(self)]
 
         if not self.config:
             logging.debug('No config found, showing onboarding')
@@ -1102,5 +1104,12 @@ class WritingToolApp(QtWidgets.QApplication):
         logging.debug('Stopping the listener')
         if self.hotkey_listener is not None:
             self.hotkey_listener.stop()
+        # Stop any child processes (e.g. the built-in llama.cpp server)
+        for provider in self.providers:
+            if hasattr(provider, 'shutdown'):
+                try:
+                    provider.shutdown()
+                except Exception as e:
+                    logging.warning(f'Error shutting down provider {provider.provider_name}: {e}')
         logging.debug('Exiting application')
         self.quit()
