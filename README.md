@@ -214,8 +214,15 @@ These instructions are for any Writing Tools version, using the OpenAI-Compatibl
 
 **Built-in llama.cpp (no other app needed):**
 1. Download a `llama-server` build from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) (or build it yourself), and download any `.gguf` model.
-2. In Writing Tools Settings, choose **Local llama.cpp (Built-in)**, set the `llama-server` path (or leave it as `llama-server` if it's on your PATH), and pick your `.gguf` file with **Browse...**.
-3. Writing Tools starts the server for you on first use, keeps it loaded for the configured idle time (default 10 minutes), and shuts it down when you exit. Server output is logged to `writingtools_llama_server.log` in your temp folder. Use **Extra Arguments** for any other `llama-server` flags.
+2. In Writing Tools Settings, choose **Local llama.cpp (Built-in)**, set the `llama-server` path (or leave it as `llama-server` if it's on your PATH; **Check llama-server** verifies it and shows the GPUs it can use), and add your `.gguf` file(s) with **Add Model...** (or **Scan Folder...** to add everything in a folder). The model list shows each file's architecture, quantization, size, layer count and trained context length.
+3. Writing Tools starts the server for you on first use, keeps it loaded for the configured idle time (default 10 minutes), and shuts it down when you exit. Server output is logged to `writingtools_llama_server.log` in your temp folder.
+
+**Loading, configuring and tinkering with models (Settings page):**
+- **Load Model / Reload / Unload** control the server directly and show live status (loading time, port, llama.cpp build, auto-unload countdown). Loading can be cancelled, failures show llama-server's error, and **Show Log** displays its live output.
+- **Try It Out** is a playground: type a system prompt and some text, press **Run**, and watch the model stream its answer with speed statistics (tokens/s). It uses the options currently shown, even before you press **Save**, so you can adjust and re-run quickly. **Stop** interrupts generation.
+- **Generation Settings** (temperature, top-p, top-k, min-p, repeat penalty, max output tokens, seed, and a "let the model think" switch for reasoning models) apply to every request without reloading the model.
+- **Loading Options** (context size, GPU layers, CPU threads, batch size, flash attention, memory-mapping, memory-locking, idle unload time, and extra `llama-server` flags) apply when the model loads; changing one makes the next Load/Run reload the model. Each section has **Reset to Defaults**.
+- Changes made on the page take effect for **Load Model** and **Run** immediately, and become permanent when you press **Save**. A model you loaded but didn't save the settings for is unloaded when you close Settings if llama.cpp isn't your active provider.
 
 **1-bit models (e.g. PrismML's Bonsai):** these work as long as your `llama-server` build supports the model's quantization. Per [PrismML's docs](https://docs.prismml.com/download/formats), 1-bit `Q1_0` is supported by recent upstream llama.cpp, and their [pre-built binaries](https://docs.prismml.com/run/llamacpp) are the known-good fallback (and may be required for other formats such as ternary `Q2_0`). If the model fails to load, check the log file above and try a newer or PrismML `llama-server` build.
 

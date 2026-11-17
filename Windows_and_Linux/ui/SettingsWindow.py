@@ -393,6 +393,15 @@ class SettingsWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         """Handle window close event."""
+        # A provider that isn't the active one may still own a child process because it was
+        # loaded from its Settings page (e.g. llama.cpp "Load Model"): free its RAM/VRAM.
+        current = getattr(self.app, 'current_provider', None)
+        for provider in self.app.providers:
+            if provider is not current and hasattr(provider, 'shutdown'):
+                try:
+                    provider.shutdown()
+                except Exception as e:
+                    logging.warning(f'Error shutting down provider {provider.provider_name}: {e}')
         if self.providers_only:
             self.close_signal.emit()
         super().closeEvent(event)

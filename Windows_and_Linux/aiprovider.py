@@ -8,7 +8,12 @@ with the main application. It uses an abstract base class pattern for provider i
 Key Components:
 1. AIProviderSetting – Base class for provider settings (e.g. API keys, model names)
     • TextSetting      – A simple text input for settings
+    • FileSetting      – A text input with a Browse button
     • DropdownSetting  – A dropdown selection setting
+    • SpinSetting / CheckboxSetting – Numeric (with hint text) and on/off settings
+    • ModelPickerSetting – A GGUF model library picker (see ui/LlamaCppManager.py)
+    • SectionSetting / WidgetSetting / HiddenSetting – Headings, embedded widgets and
+      invisible stored values (not all of them are saved to the config file)
 
 2. AIProvider – Abstract base class that all providers implement.
    It defines the interface for:
@@ -23,6 +28,8 @@ Key Components:
     • LMStudioProvider – Connects to LM Studio's local server (OpenAI-compatible, default port 1234)
     • LlamaCppProvider – Launches and manages a bundled-free `llama-server` (llama.cpp) process itself,
       so any GGUF model (including 1-bit models like Bonsai) can be run without any other app.
+      Its Settings page lets you load/unload models, tune load and sampling options and
+      try prompts in a built-in playground.
 
 Response Flow:
    • The main app calls get_response() with a system instruction and a prompt.
@@ -57,8 +64,10 @@ from google import genai
 from google.genai import types as genai_types
 from ollama import Client as OllamaClient
 from openai import OpenAI
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 from PySide6.QtWidgets import QVBoxLayout
+from ui.LlamaCppManager import (SPIN_CSS, FG, LlamaControlPanel, LlamaPlayground, ModelPickerWidget,
+                                SECONDARY_BUTTON_CSS, muted_label, section_title)
 from ui.UIUtils import colorMode
 
 # Obfuscation prefix to identify encrypted API keys
@@ -92,7 +101,12 @@ def deobfuscate_api_key(obfuscated: str) -> str:
 class AIProviderSetting(ABC):
     """
     Abstract base class for a provider setting (e.g., API key, model selection).
+
+    Settings with `persist = False` are pure UI (section headings, buttons, panels):
+    nothing is read from or written to the config file for them.
     """
+    persist = True
+
     def __init__(self, name: str, display_name: str = None, default_value: str = None, description: str = None):
         self.name = name
         self.display_name = display_name if display_name else name
@@ -112,6 +126,10 @@ class AIProviderSetting(ABC):
     @abstractmethod
     def get_value(self):
         """Return the current value from the widget."""
+        pass
+
+    def reset(self):
+        """Put the setting (and its widget, if shown) back to its default value."""
         pass
 
 
@@ -146,6 +164,11 @@ class TextSetting(AIProviderSetting):
 
     def get_value(self):
         return self.input.text()
+
+    def reset(self):
+        self.internal_value = self.default_value
+        if self.input is not None:
+            self.input.setText(self.default_value or "")
 
 
 class FileSetting(TextSetting):
@@ -292,6 +315,216 @@ class DropdownSetting(AIProviderSetting):
             return self.custom_input.text().strip()
         return self.dropdown.currentData()
 
+    def reset(self):
+        self.internal_value = self.default_value
+        if self.dropdown is not None:
+            index = self.dropdown.findData(self.default_value)
+            self.dropdown.setCurrentIndex(max(index, 0))
+
+
+def _add_with_hint(layout: QVBoxLayout, control, description: str):
+    """Add a control (widget or layout) with its hint text tucked right underneath it."""
+    group = QtWidgets.QVBoxLayout()
+    group.setContentsMargins(0, 0, 0, 0)
+    group.setSpacing(1)
+    if isinstance(control, QtWidgets.QLayout):
+        group.addLayout(control)
+    else:
+        group.addWidget(control)
+    if description:
+        group.addWidget(muted_label(description))
+    layout.addLayout(group)
+
+
+class _NoWheelSpinBox(QtWidgets.QSpinBox):
+    """Spin box that ignores the mouse wheel unless focused, so scrolling the page doesn't change values."""
+    def wheelEvent(self, event):
+        event.ignore() if not self.hasFocus() else super().wheelEvent(event)
+
+
+class _NoWheelDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+    def wheelEvent(self, event):
+        event.ignore() if not self.hasFocus() else super().wheelEvent(event)
+
+
+class SpinSetting(AIProviderSetting):
+    """
+    A numeric setting shown as a spin box. `decimals=0` gives an integer setting.
+    `special_text` is shown instead of the number when the value equals `minimum`
+    (e.g. "Auto" for 0), which is how "off / default / unlimited" values are labelled.
+    The description is shown as a small hint line under the control.
+    """
+    def __init__(self, name: str, display_name: str = None, default_value=0, description: str = None,
+                 minimum=0, maximum=1_000_000, step=1, decimals: int = 0,
+                 special_text: str = None, suffix: str = ""):
+        super().__init__(name, display_name, None, description)
+        self.default_value = default_value  # (the base class turns falsy values like 0 into "")
+        self.minimum, self.maximum, self.step, self.decimals = minimum, maximum, step, decimals
+        self.special_text, self.suffix = special_text, suffix
+        self.internal_value = default_value
+        self.spin = None
+
+    def _coerce(self, value):
+        try:
+            number = float(value) if self.decimals else int(float(value))
+        except (TypeError, ValueError):
+            number = self.default_value
+        return min(max(number, self.minimum), self.maximum)
+
+    def render_to_layout(self, layout: QVBoxLayout):
+        row_layout = QtWidgets.QHBoxLayout()
+        label = QtWidgets.QLabel(self.display_name)
+        label.setStyleSheet(f"font-size: 16px; color: {FG};")
+        row_layout.addWidget(label)
+        row_layout.addStretch(1)
+        if self.decimals:
+            self.spin = _NoWheelDoubleSpinBox()
+            self.spin.setDecimals(self.decimals)
+        else:
+            self.spin = _NoWheelSpinBox()
+        self.spin.setRange(self.minimum, self.maximum)
+        self.spin.setSingleStep(self.step)
+        if self.special_text:
+            self.spin.setSpecialValueText(self.special_text)
+        if self.suffix:
+            self.spin.setSuffix(self.suffix)
+        self.spin.setValue(self._coerce(self.internal_value))
+        self.spin.setFixedWidth(150)
+        # No `border` here: any border rule makes Qt drop the native up/down arrows.
+        self.spin.setStyleSheet(SPIN_CSS)
+        self.spin.setToolTip(self.description)
+        row_layout.addWidget(self.spin)
+        _add_with_hint(layout, row_layout, self.description)
+
+    def set_value(self, value):
+        self.internal_value = self._coerce(value)
+
+    def get_value(self):
+        return self.spin.value()
+
+    def reset(self):
+        self.internal_value = self.default_value
+        if self.spin is not None:
+            self.spin.setValue(self.default_value)
+
+
+class CheckboxSetting(AIProviderSetting):
+    """An on/off setting shown as a checkbox, with the description as a hint line below."""
+    def __init__(self, name: str, display_name: str = None, default_value: bool = False, description: str = None):
+        super().__init__(name, display_name, None, description)
+        self.default_value = bool(default_value)
+        self.internal_value = self.default_value
+        self.checkbox = None
+
+    @staticmethod
+    def _coerce(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def render_to_layout(self, layout: QVBoxLayout):
+        self.checkbox = QtWidgets.QCheckBox(self.display_name)
+        self.checkbox.setStyleSheet(f"font-size: 16px; color: {FG};")
+        self.checkbox.setChecked(self.internal_value)
+        self.checkbox.setToolTip(self.description)
+        _add_with_hint(layout, self.checkbox, self.description)
+
+    def set_value(self, value):
+        self.internal_value = self._coerce(value)
+
+    def get_value(self):
+        return self.checkbox.isChecked()
+
+    def reset(self):
+        self.internal_value = self.default_value
+        if self.checkbox is not None:
+            self.checkbox.setChecked(self.default_value)
+
+
+class HiddenSetting(AIProviderSetting):
+    """A value that is saved in the config but has no widget of its own (e.g. a list of paths)."""
+    def __init__(self, name: str, default_value=None):
+        super().__init__(name, name, None, None)
+        self.default_value = default_value
+        self.internal_value = default_value
+
+    def render_to_layout(self, layout: QVBoxLayout):
+        pass
+
+    def set_value(self, value):
+        self.internal_value = value
+
+    def get_value(self):
+        return self.internal_value
+
+
+class SectionSetting(AIProviderSetting):
+    """A heading (with an optional hint line) that groups the settings below it. Not saved."""
+    persist = False
+
+    def __init__(self, title: str, description: str = None):
+        super().__init__(title, title, None, description)
+
+    def render_to_layout(self, layout: QVBoxLayout):
+        layout.addWidget(section_title(self.display_name))
+        if self.description:
+            layout.addWidget(muted_label(self.description))
+
+    def set_value(self, value):
+        pass
+
+    def get_value(self):
+        return None
+
+
+class WidgetSetting(AIProviderSetting):
+    """Embeds an arbitrary widget (built by `factory()` each time the page is shown). Not saved."""
+    persist = False
+
+    def __init__(self, name: str, factory):
+        super().__init__(name, name, None, None)
+        self.factory = factory
+
+    def render_to_layout(self, layout: QVBoxLayout):
+        layout.addWidget(self.factory())
+
+    def set_value(self, value):
+        pass
+
+    def get_value(self):
+        return None
+
+
+class ModelPickerSetting(AIProviderSetting):
+    """
+    Pick a GGUF model from a library of known files (see ModelPickerWidget).
+    The selected file path is the value; the library list is kept in `library_setting`.
+    """
+    def __init__(self, name: str, display_name: str, library_setting: HiddenSetting):
+        super().__init__(name, display_name, "", "Path to a .gguf model file")
+        self.library_setting = library_setting
+        self.internal_value = ""
+        self.widget = None
+
+    def render_to_layout(self, layout: QVBoxLayout):
+        library = self.library_setting.get_value() or []
+        self.widget = ModelPickerWidget(self.display_name, self.internal_value, library)
+        self.widget.changed.connect(self._sync_library)
+        layout.addWidget(self.widget)
+        self._sync_library()
+
+    def _sync_library(self):
+        self.library_setting.set_value(self.widget.library())
+
+    def set_value(self, value):
+        self.internal_value = value or ""
+
+    def get_value(self):
+        return self.widget.selected_path()
+
+    def reset(self):
+        pass
+
 
 class AIProvider(ABC):
     """
@@ -328,6 +561,8 @@ class AIProvider(ABC):
         Load configuration settings into the provider.
         """
         for setting in self.settings:
+            if not setting.persist:
+                continue
             if setting.name in config:
                 setattr(self, setting.name, config[setting.name])
                 setting.set_value(config[setting.name])
@@ -341,7 +576,8 @@ class AIProvider(ABC):
         """
         config = {}
         for setting in self.settings:
-            config[setting.name] = setting.get_value()
+            if setting.persist:
+                config[setting.name] = setting.get_value()
         self.app.config["providers"][self.provider_name] = config
         self.app.save_config(self.app.config)
 
@@ -719,6 +955,13 @@ class _LocalOpenAIStyleProvider(AIProvider):
         """Called once a request finishes (successfully or not)."""
         pass
 
+    def _request_kwargs(self) -> dict:
+        """Extra keyword arguments (sampling parameters etc.) for chat.completions.create()."""
+        kwargs = {"temperature": 0.5}
+        if self.extra_body:
+            kwargs["extra_body"] = self.extra_body
+        return kwargs
+
     @staticmethod
     def _clean(text: str) -> str:
         """Strip reasoning blocks so only the final answer replaces the user's text."""
@@ -737,15 +980,11 @@ class _LocalOpenAIStyleProvider(AIProvider):
 
         try:
             model = self._prepare_request()
-            kwargs = {}
-            if self.extra_body:
-                kwargs["extra_body"] = self.extra_body
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.5,
                 stream=False,
-                **kwargs
+                **self._request_kwargs()
             )
             response_text = self._clean(response.choices[0].message.content)
 
@@ -828,9 +1067,15 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
     Runs models locally by launching and managing a llama.cpp `llama-server` process.
 
     No other app (Ollama, LM Studio...) is needed: pick a `llama-server` binary and a
-    GGUF model file in Settings. The server is started on first use on a free local
-    port, reused for later requests, restarted if settings change, shut down after an
-    idle timeout (to free RAM/VRAM) and when Writing Tools exits.
+    GGUF model in Settings. The server is started on first use on a free local port
+    (or on demand from the Settings page), reused for later requests, restarted if its
+    launch settings change, shut down after an idle timeout (to free RAM/VRAM) and when
+    Writing Tools exits.
+
+    The Settings page offers a model library, Load/Unload buttons with live status,
+    every common load option and sampling parameter, a log viewer and a playground for
+    trying the model out. Values shown there apply to the Load button and the
+    playground immediately; Save makes them permanent.
 
     1-bit / low-bit models (e.g. PrismML's Bonsai, quantized as Q1_0) work as long as
     the `llama-server` build supports the model's quantization type. Recent upstream
@@ -838,31 +1083,97 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
     """
     HEALTH_TIMEOUT_SECONDS = 600  # Loading a big model from a slow disk can take minutes.
 
+    # Settings that are applied per request (no model reload needed).
+    GENERATION_SETTINGS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+                           "max_tokens", "seed", "enable_thinking")
+    # Settings that need the server to be (re)started to take effect.
+    LOADING_SETTINGS = ("context_size", "gpu_layers", "threads", "batch_size", "flash_attn",
+                        "use_mmap", "mlock", "idle_minutes", "extra_args")
+
     def __init__(self, app):
         self.close_requested = None
         self.client = None
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()          # serializes starting/stopping the server
+        self._timer_lock = threading.Lock()     # guards the idle timer (never held for long)
+        self._counter_lock = threading.Lock()
         self._process = None
         self._port = None
         self._started_with = None
+        self._loaded_model = None
         self._log_path = os.path.join(tempfile.gettempdir(), "writingtools_llama_server.log")
         self._idle_timer = None
-        self.extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+        self._idle_deadline = None
+        self._busy = 0
+        # Live state shown in the Settings page.
+        self._state = "stopped"                 # stopped | loading | running | error
+        self._detail = ""
+        self._load_started = None
+        self._load_seconds = None
+        self._started_at = None
+        self._build = ""
+        self._loading_requested = False
+        self._load_cancel = threading.Event()
+        self.playground_prompts = {
+            "system": "You are a proofreading assistant. Fix grammar, spelling and punctuation in the "
+                      "user's text. Output ONLY the corrected text.",
+            "user": "i has went to the store yesterday and buyed three apple, but they was rotten.",
+        }
 
+        library = HiddenSetting("model_library", [])
         settings = [
+            SectionSetting("Model"),
             FileSetting("server_binary", "llama-server", "llama-server",
                         "Path to llama-server, or just 'llama-server' if it is on your PATH",
                         file_filter="All files (*)"),
-            FileSetting("model_path", "GGUF Model", "", "Path to a .gguf model file",
-                        file_filter="GGUF models (*.gguf);;All files (*)"),
-            TextSetting("context_size", "Context Size (tokens)", "8192", "E.g. 8192"),
-            TextSetting("gpu_layers", "GPU Layers", "99", "99 = offload everything, 0 = CPU only"),
-            TextSetting("idle_minutes", "Unload After Idle (minutes)", "10", "0 = keep loaded until the app exits"),
-            TextSetting("extra_args", "Extra Arguments", "", "Optional llama-server flags, e.g. --threads 8"),
+            library,
+            ModelPickerSetting("model_path", "GGUF Model", library),
+            WidgetSetting("control_panel", lambda: LlamaControlPanel(self)),
+
+            SectionSetting("Try It Out"),
+            WidgetSetting("playground", lambda: LlamaPlayground(self)),
+
+            SectionSetting("Generation Settings", "Applied to every request. No reload needed."),
+            SpinSetting("temperature", "Temperature", 0.5, "Higher = more creative, lower = more predictable",
+                        minimum=0.0, maximum=2.0, step=0.05, decimals=2),
+            SpinSetting("top_p", "Top P", 0.95, "Only sample from the smallest set of tokens covering this much probability (1 = off)",
+                        minimum=0.0, maximum=1.0, step=0.05, decimals=2),
+            SpinSetting("top_k", "Top K", 40, "Only sample from the K most likely tokens",
+                        minimum=0, maximum=1000, special_text="Off"),
+            SpinSetting("min_p", "Min P", 0.05, "Drop tokens less likely than this fraction of the best one (0 = off)",
+                        minimum=0.0, maximum=1.0, step=0.01, decimals=2),
+            SpinSetting("repeat_penalty", "Repeat Penalty", 1.0, "Above 1 discourages repeating itself (1 = off)",
+                        minimum=0.5, maximum=2.0, step=0.05, decimals=2),
+            SpinSetting("max_tokens", "Max Output Tokens", 0, "Stop generating after this many tokens",
+                        minimum=0, maximum=131072, step=64, special_text="No limit"),
+            SpinSetting("seed", "Seed", -1, "Fix a seed for repeatable output (needs Temperature above 0 to matter)",
+                        minimum=-1, maximum=2147483647, special_text="Random"),
+            CheckboxSetting("enable_thinking", "Let the model think before answering", False,
+                            "Only for reasoning models. Slower; the reasoning is removed from the final text."),
+            WidgetSetting("reset_generation", lambda: self._reset_button(self.GENERATION_SETTINGS)),
+
+            SectionSetting("Loading Options", "Applied when the model is loaded. Changing these reloads it."),
+            SpinSetting("context_size", "Context Size", 8192, "Max tokens of text + answer the model can handle at once (more = more memory)",
+                        minimum=256, maximum=1048576, step=1024, suffix=" tokens"),
+            SpinSetting("gpu_layers", "GPU Layers", 99, "99 = put everything on the GPU, 0 = CPU only",
+                        minimum=0, maximum=999),
+            SpinSetting("threads", "CPU Threads", 0, "Threads used for CPU work",
+                        minimum=0, maximum=256, special_text="Auto"),
+            SpinSetting("batch_size", "Batch Size", 0, "Tokens processed at once while reading your text",
+                        minimum=0, maximum=65536, step=128, special_text="Default"),
+            DropdownSetting("flash_attn", "Flash Attention", "auto", "Faster and lighter on memory where supported",
+                            options=[("Auto", "auto"), ("On", "on"), ("Off", "off")]),
+            CheckboxSetting("use_mmap", "Memory-map the model file", True,
+                            "Faster loading and shared memory. Turn off if loading is slow from a network drive."),
+            CheckboxSetting("mlock", "Keep the model in RAM", False,
+                            "Stops the OS from swapping the model out (needs enough free RAM)."),
+            SpinSetting("idle_minutes", "Unload After Idle", 10, "Free RAM/VRAM after this long without a request",
+                        minimum=0, maximum=1440, special_text="Never", suffix=" min"),
+            TextSetting("extra_args", "Extra Arguments", "", "Any other llama-server flags, e.g. --rope-scaling yarn"),
+            WidgetSetting("reset_loading", lambda: self._reset_button(self.LOADING_SETTINGS)),
         ]
         super().__init__(app, "Local llama.cpp (Built-in)", settings,
             "• Runs GGUF models directly on your PC with llama.cpp. No other app needed.\n"
-            "• Point to a llama-server binary and a .gguf model file.\n"
+            "• Add a model, then load, tweak and test it right here.\n"
             "• Supports 1-bit models like Bonsai (Q1_0) when your llama-server build supports them.",
             "llamacpp", "Get llama.cpp",
             lambda: webbrowser.open("https://github.com/ggml-org/llama.cpp/releases"))
@@ -873,12 +1184,64 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
     @staticmethod
     def _int(value, default: int) -> int:
         try:
-            return int(str(value).strip())
+            return int(float(str(value).strip()))
         except (TypeError, ValueError):
             return default
 
-    def _find_binary(self) -> str:
-        configured = (self.server_binary or "llama-server").strip().strip('"')
+    @staticmethod
+    def _float(value, default: float) -> float:
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _bool(value, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _saved_cfg(self) -> dict:
+        """The settings last loaded from the config file (defaults for anything missing)."""
+        return {s.name: getattr(self, s.name, s.default_value) for s in self.settings if s.persist}
+
+    def form_config(self) -> dict:
+        """
+        The settings as currently shown in the Settings page (saved or not). Falls back
+        to the saved value for any setting whose widget isn't on screen.
+        """
+        cfg = self._saved_cfg()
+        for s in self.settings:
+            if not s.persist:
+                continue
+            try:
+                cfg[s.name] = s.get_value()
+            except (RuntimeError, AttributeError):
+                pass  # widget not created, or already deleted
+        return cfg
+
+    def _reset_button(self, names) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton("Reset to Defaults")
+        button.setStyleSheet(SECONDARY_BUTTON_CSS)
+        button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+
+        def reset():
+            for s in self.settings:
+                if s.name in names:
+                    s.reset()
+        button.clicked.connect(reset)
+        container = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        row.addWidget(button)
+        return container
+
+    def _find_binary(self, cfg: dict = None) -> str:
+        cfg = cfg or self._saved_cfg()
+        configured = (cfg.get("server_binary") or "llama-server").strip().strip('"')
         exe = "llama-server.exe" if sys.platform == "win32" else "llama-server"
         if os.path.isdir(configured):
             candidate = os.path.join(configured, exe)
@@ -893,31 +1256,109 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
             f"Could not find llama-server ('{configured}'). Download llama.cpp from "
             "github.com/ggml-org/llama.cpp/releases, then set the llama-server path in Settings.")
 
-    def _build_command(self, port: int) -> list:
+    def _build_command(self, port: int, cfg: dict) -> list:
         import shlex
-        model = (self.model_path or "").strip().strip('"')
+        model = (cfg.get("model_path") or "").strip().strip('"')
         if not model or not os.path.isfile(model):
-            raise RuntimeError("No valid GGUF model selected. Choose a .gguf file in Settings.")
+            raise RuntimeError("No valid GGUF model selected. Add or choose a .gguf file in Settings.")
         cmd = [
-            self._find_binary(), "-m", model,
+            self._find_binary(cfg), "-m", model,
             "--host", "127.0.0.1", "--port", str(port),
-            "-c", str(self._int(self.context_size, 8192)),
-            "-ngl", str(self._int(self.gpu_layers, 99)),
+            "-c", str(self._int(cfg.get("context_size"), 8192)),
+            "-ngl", str(self._int(cfg.get("gpu_layers"), 99)),
         ]
-        cmd += shlex.split(self.extra_args or "", posix=(sys.platform != "win32"))
+        threads = self._int(cfg.get("threads"), 0)
+        if threads > 0:
+            cmd += ["-t", str(threads)]
+        batch = self._int(cfg.get("batch_size"), 0)
+        if batch > 0:
+            cmd += ["-b", str(batch)]
+        if cfg.get("flash_attn") in ("on", "off"):
+            cmd += ["-fa", cfg["flash_attn"]]
+        if not self._bool(cfg.get("use_mmap"), True):
+            cmd.append("--no-mmap")
+        if self._bool(cfg.get("mlock"), False):
+            cmd.append("--mlock")
+        cmd += shlex.split(cfg.get("extra_args") or "", posix=(sys.platform != "win32"))
         return cmd
 
-    def _settings_signature(self) -> tuple:
-        return (self.server_binary, self.model_path, self.context_size, self.gpu_layers, self.extra_args)
+    def _launch_signature(self, cfg: dict) -> tuple:
+        """Everything that requires a server restart when it changes."""
+        return (
+            (cfg.get("server_binary") or "").strip(), (cfg.get("model_path") or "").strip(),
+            self._int(cfg.get("context_size"), 8192), self._int(cfg.get("gpu_layers"), 99),
+            self._int(cfg.get("threads"), 0), self._int(cfg.get("batch_size"), 0),
+            cfg.get("flash_attn") or "auto", self._bool(cfg.get("use_mmap"), True),
+            self._bool(cfg.get("mlock"), False), (cfg.get("extra_args") or "").strip(),
+        )
 
-    # -- server lifecycle --------------------------------------------------------
+    def _request_kwargs(self, cfg: dict = None) -> dict:
+        """Sampling parameters for chat.completions.create(), from `cfg` or the saved settings."""
+        cfg = cfg or self._saved_cfg()
+        kwargs = {
+            "temperature": self._float(cfg.get("temperature"), 0.5),
+            "top_p": self._float(cfg.get("top_p"), 0.95),
+        }
+        max_tokens = self._int(cfg.get("max_tokens"), 0)
+        if max_tokens > 0:
+            kwargs["max_tokens"] = max_tokens
+        seed = self._int(cfg.get("seed"), -1)
+        if seed >= 0:
+            kwargs["seed"] = seed
+        # llama-server accepts these extra sampling fields on its OpenAI-compatible endpoint.
+        kwargs["extra_body"] = {
+            "top_k": self._int(cfg.get("top_k"), 40),
+            "min_p": self._float(cfg.get("min_p"), 0.05),
+            "repeat_penalty": self._float(cfg.get("repeat_penalty"), 1.0),
+            "chat_template_kwargs": {"enable_thinking": self._bool(cfg.get("enable_thinking"), False)},
+        }
+        return kwargs
 
-    def _log_tail(self, lines: int = 8) -> str:
+    # -- status (read by the Settings page; never takes the server lock) ----------
+
+    def status(self) -> dict:
+        """A snapshot of the server's state for the UI."""
+        process = self._process
+        if self._state == "running" and process is not None and process.poll() is not None:
+            self._state = "stopped"
+            self._detail = (f"llama-server stopped unexpectedly (exit code {process.returncode}). "
+                            "Check the log for details.")
+        state = self._state
+        now = time.time()
+        info = {"state": state, "detail": self._detail}
+        if state == "loading":
+            info["elapsed"] = now - (self._load_started or now)
+        elif state == "running":
+            info.update({
+                "model": self._loaded_model or "model", "port": self._port, "build": self._build,
+                "load_seconds": self._load_seconds, "uptime": now - (self._started_at or now),
+                "busy": self._busy > 0,
+                "idle_in": max(0.0, self._idle_deadline - now) if self._idle_deadline else None,
+            })
+        return info
+
+    def log_tail(self, lines: int = 8) -> str:
         try:
             with open(self._log_path, "r", errors="replace") as f:
                 return "".join(f.readlines()[-lines:]).strip()
         except OSError:
             return ""
+
+    _log_tail = log_tail
+
+    def check_binary(self, cfg: dict = None) -> str:
+        """Run `llama-server --version` and describe the result (also lists detected GPUs)."""
+        exe = self._find_binary(cfg)
+        kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+        try:
+            result = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30,
+                                    stdin=subprocess.DEVNULL, errors="replace", **kwargs)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{exe} did not respond to --version within 30 seconds.")
+        lines = [l.strip() for l in (result.stdout + "\n" + result.stderr).splitlines() if l.strip()]
+        return "✔ " + exe + "\n" + "\n".join(lines[:6])
+
+    # -- server lifecycle --------------------------------------------------------
 
     def _wait_until_ready(self, process, port: int):
         deadline = time.time() + self.HEALTH_TIMEOUT_SECONDS
@@ -925,54 +1366,74 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
         # Never route the local health check through a system/env HTTP proxy.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         while time.time() < deadline:
-            if self.close_requested:
+            if self.close_requested or self._load_cancel.is_set():
                 raise RuntimeError("Cancelled while the model was loading.")
             if process.poll() is not None:
                 raise RuntimeError(
                     f"llama-server exited while loading the model (code {process.returncode}). "
-                    f"Your llama-server build may not support this model's format.\n\n{self._log_tail()}")
+                    f"Your llama-server build may not support this model's format.\n\n{self.log_tail()}")
             try:
                 with opener.open(url, timeout=2) as resp:
                     if resp.status == 200:
-                        return
+                        return opener
             except Exception:
                 pass  # 503 while loading, or not listening yet
             time.sleep(0.5)
         raise RuntimeError("Timed out waiting for llama-server to load the model.")
 
-    def _start_server(self):
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        cmd = self._build_command(port)
-        logging.info(f"Starting llama-server: {cmd}")
-
-        kwargs = {}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        log = open(self._log_path, "w")
+    def _fetch_build(self, opener, port: int) -> str:
         try:
-            process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kwargs)
-        finally:
-            log.close()
-        self._process, self._port = process, port
-        try:
-            self._wait_until_ready(process, port)
+            with opener.open(f"http://127.0.0.1:{port}/props", timeout=3) as resp:
+                import json
+                return str(json.load(resp).get("build_info") or "")
         except Exception:
-            self._stop_server()
+            return ""
+
+    def _start_server(self, cfg: dict):
+        self._load_cancel.clear()
+        self._load_started, self._load_seconds, self._build = time.time(), None, ""
+        self._state, self._detail = "loading", ""
+        try:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            cmd = self._build_command(port, cfg)
+            logging.info(f"Starting llama-server: {cmd}")
+
+            kwargs = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            log = open(self._log_path, "w")
+            try:
+                process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kwargs)
+            finally:
+                log.close()
+            self._process, self._port = process, port
+            opener = self._wait_until_ready(process, port)
+        except Exception as e:
+            if self._load_cancel.is_set():
+                self._stop_server("stopped", "Loading was cancelled.")
+            else:
+                self._stop_server("error", str(e))
             raise
-        self._started_with = self._settings_signature()
+        self._started_with = self._launch_signature(cfg)
+        self._loaded_model = os.path.basename((cfg.get("model_path") or "model").strip().strip('"'))
+        self._build = self._fetch_build(opener, port)
         # The server is on loopback; don't let HTTP(S)_PROXY env vars intercept it.
         self.client = OpenAI(api_key="llama-cpp", base_url=f"http://127.0.0.1:{port}/v1", timeout=600.0,
                              http_client=httpx.Client(trust_env=False, timeout=600.0))
+        self._load_seconds = time.time() - self._load_started
+        self._started_at = time.time()
+        self._state = "running"
 
-    def _stop_server(self):
+    def _stop_server(self, state: str = "stopped", detail: str = ""):
+        """Stop the server and record why (the detail is shown in the Settings page)."""
         with self._lock:
+            self._detail = detail  # set first so a reader that sees the new state also sees its detail
+            self._state = state
             process, self._process = self._process, None
             self._started_with = None
-            if self._idle_timer:
-                self._idle_timer.cancel()
-                self._idle_timer = None
+            self._cancel_idle_shutdown()
         if process and process.poll() is None:
             process.terminate()
             try:
@@ -980,60 +1441,182 @@ class LlamaCppProvider(_LocalOpenAIStyleProvider):
             except subprocess.TimeoutExpired:
                 process.kill()
 
-    def _cancel_idle_shutdown(self):
-        with self._lock:
-            if self._idle_timer:
-                self._idle_timer.cancel()
-                self._idle_timer = None
+    def _stop_server_in_background(self):
+        threading.Thread(target=self._stop_server, daemon=True).start()
 
-    def _schedule_idle_shutdown(self):
-        minutes = self._int(self.idle_minutes, 10)
-        with self._lock:
+    def _cancel_idle_shutdown(self):
+        with self._timer_lock:
             if self._idle_timer:
                 self._idle_timer.cancel()
                 self._idle_timer = None
-            if minutes <= 0 or self._process is None:
+            self._idle_deadline = None
+
+    def _schedule_idle_shutdown(self, minutes=None):
+        """(Re)start the countdown to unload the model, unless a request is in flight."""
+        if minutes is None:
+            minutes = self._saved_cfg().get("idle_minutes")
+        minutes = self._int(minutes, 10)
+        with self._timer_lock:
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+            self._idle_deadline = None
+            if minutes <= 0 or self._process is None or self._busy > 0:
                 return
-            self._idle_timer = threading.Timer(minutes * 60, self._stop_server)
+            self._idle_timer = threading.Timer(minutes * 60, self._unload_idle)
             self._idle_timer.daemon = True
             self._idle_timer.start()
+            self._idle_deadline = time.time() + minutes * 60
+
+    def _unload_idle(self):
+        self._stop_server("stopped", "Unloaded automatically after being idle.")
+
+    def _ensure_server(self, cfg: dict = None, force: bool = False) -> dict:
+        """Make sure a server matching `cfg` (default: saved settings) is running."""
+        cfg = cfg or self._saved_cfg()
+        with self._lock:
+            alive = self._process is not None and self._process.poll() is None
+            if force or not alive or self._started_with != self._launch_signature(cfg):
+                self._stop_server()
+                self._start_server(cfg)
+            # Never unload the model while a request is in flight; the idle
+            # countdown restarts when the request finishes.
+            self._cancel_idle_shutdown()
+        return cfg
+
+    def _bump_busy(self, delta: int):
+        with self._counter_lock:
+            self._busy = max(0, self._busy + delta)
+
+    # -- actions used by the Settings page (all non-blocking) ----------------------
+
+    def load_model_async(self, cfg: dict = None, force: bool = False):
+        """Load the model in the background, using `cfg` (default: saved settings)."""
+        if self._loading_requested or self._state == "loading":
+            return
+        self._loading_requested = True
+        cfg = cfg or self._saved_cfg()
+
+        def work():
+            try:
+                self._ensure_server(cfg, force=force)
+                self._schedule_idle_shutdown(cfg.get("idle_minutes"))
+            except Exception as e:
+                logging.warning(f"Loading llama.cpp model failed: {e}")  # shown in the UI via status()
+            finally:
+                self._loading_requested = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def cancel_load(self):
+        self._load_cancel.set()
+
+    def unload_model(self):
+        self.client = None
+        self._detail = ""
+        self._stop_server_in_background()
+
+    def playground_generate(self, system: str, prompt: str, cfg: dict, on_token, stop_event) -> str:
+        """
+        Stream a completion for the Settings playground using `cfg`, loading (or reloading)
+        the model first if needed. Calls on_token(text, kind) with kind "text" or "thinking".
+        Returns a one-line summary with speed statistics.
+        """
+        messages = []
+        if (system or "").strip():
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        self._bump_busy(1)
+        try:
+            try:
+                self._ensure_server(cfg)
+            except RuntimeError:
+                if stop_event.is_set():
+                    return "Stopped."
+                raise
+            client, model = self.client, self._loaded_model
+            if client is None:
+                raise RuntimeError("The model was unloaded.")
+            generation_started = time.time()
+            chunks, first_token_at, timings, usage = 0, None, None, None
+            stream = client.chat.completions.create(
+                model=model, messages=messages, stream=True,
+                stream_options={"include_usage": True}, **self._request_kwargs(cfg))
+            try:
+                for chunk in stream:
+                    if stop_event.is_set():
+                        break
+                    extra = getattr(chunk, "model_extra", None) or {}
+                    timings = extra.get("timings") or timings
+                    usage = getattr(chunk, "usage", None) or usage
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    reasoning = (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
+                    if reasoning:
+                        on_token(reasoning, "thinking")
+                    if delta.content:
+                        on_token(delta.content, "text")
+                    if reasoning or delta.content:
+                        first_token_at = first_token_at or time.time()
+                        chunks += 1
+            finally:
+                stream.close()
+            elapsed = time.time() - generation_started
+        finally:
+            self._bump_busy(-1)
+            self._schedule_idle_shutdown(cfg.get("idle_minutes"))
+
+        stopped = stop_event.is_set()
+        if timings and timings.get("predicted_n") is not None:
+            parts = [f"{timings['predicted_n']} tokens", f"{timings.get('predicted_per_second', 0):.1f} tok/s"]
+            if timings.get("prompt_n"):
+                parts.append(f"prompt {timings['prompt_n']} tokens at {timings.get('prompt_per_second', 0):.0f} tok/s")
+        else:
+            tokens = getattr(usage, "completion_tokens", None) or chunks
+            gen_time = (time.time() - first_token_at) if first_token_at else 0
+            parts = [f"~{tokens} tokens"]
+            if gen_time > 0.2 and tokens > 1:
+                parts.append(f"~{(tokens - 1) / gen_time:.1f} tok/s")
+        parts.append(f"{elapsed:.1f}s")
+        if first_token_at:
+            parts.append(f"first token after {first_token_at - generation_started:.1f}s")
+        return ("Stopped — " if stopped else "Done — ") + " · ".join(parts)
 
     # -- provider interface ------------------------------------------------------
 
     def _prepare_request(self) -> str:
-        with self._lock:
-            alive = self._process is not None and self._process.poll() is None
-            if not alive or self._started_with != self._settings_signature():
-                self._stop_server()
-                self._start_server()
-            # Never unload the model while a request is in flight; the idle
-            # countdown restarts in _after_request() once it finishes.
-            self._cancel_idle_shutdown()
+        self._bump_busy(1)  # balanced by _after_request(), which always runs
+        self._ensure_server()
         # llama-server serves the one model it was started with; the name is informational.
-        return os.path.basename(self.model_path or "model")
+        return self._loaded_model or "model"
 
     def _friendly_error(self, error: Exception) -> str:
         return str(error) if isinstance(error, RuntimeError) else f"An error occurred: {error}"
 
     def _after_request(self):
+        self._bump_busy(-1)
         self._schedule_idle_shutdown()
 
     def after_load(self):
         # Only drop a running server if its launch settings changed (saving unrelated
         # settings shouldn't force a slow model reload); it restarts lazily on next use.
-        with self._lock:
-            if self._started_with is not None and self._started_with != self._settings_signature():
-                self._stop_server()
-                self.client = None
-            elif self._process is not None:
-                self._schedule_idle_shutdown()  # idle timeout may have changed
+        # This runs on the UI thread, so it must never wait for a model that is mid-load.
+        if self._started_with is not None and self._started_with != self._launch_signature(self._saved_cfg()):
+            self.client = None
+            self._stop_server_in_background()
+        elif self._process is not None:
+            self._schedule_idle_shutdown()  # idle timeout may have changed
 
     def before_load(self):
-        self._stop_server()
         self.client = None
+        self._stop_server_in_background()
 
     def cancel(self):
         self.close_requested = True
 
     def shutdown(self):
+        # Abort any in-progress load first so we don't wait on it.
+        self._load_cancel.set()
         self._stop_server()
