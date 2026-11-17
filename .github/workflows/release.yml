@@ -1,0 +1,87 @@
+name: Release build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v9.1). Notes are read from release-notes/<tag>.md"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            binary: Writing Tools.exe
+          - os: ubuntu-22.04   # older glibc = runs on more distros
+            platform: Linux
+            binary: Writing Tools
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: Windows_and_Linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build
+        run: python pyinstaller-build-script.py
+      - name: Package
+        run: |
+          out="Writing Tools"
+          mkdir -p "pkg/$out"
+          cp "dist/${{ matrix.binary }}" "pkg/$out/"
+          cp -r icons locales background*.png options.json "pkg/$out/"
+          cd pkg
+          zip_name="Writing.Tools.${TAG}.${{ matrix.platform }}.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -Command "Compress-Archive -Path '$out' -DestinationPath '$zip_name'"
+          else
+            chmod +x "$out/${{ matrix.binary }}"
+            zip -r -q "$zip_name" "$out"
+          fi
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: Windows_and_Linux/pkg/*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="release-notes/${TAG}.md"
+          [ -f "$notes" ] || { echo "Missing $notes"; exit 1; }
+          title="Writing Tools ${TAG}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/*.zip --clobber
+            gh release edit "$TAG" --notes-file "$notes"
+          else
+            gh release create "$TAG" artifacts/*.zip --target "$GITHUB_SHA" --title "$title" --notes-file "$notes"
+          fi
