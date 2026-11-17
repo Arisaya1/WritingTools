@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 
@@ -75,14 +76,24 @@ def run_pyinstaller_build():
         "main.py"
     ]
 
+    # pynput picks its keyboard/mouse backend at runtime, so PyInstaller can't see it.
+    if sys.platform.startswith("linux"):
+        backends = ["pynput.keyboard._xorg", "pynput.mouse._xorg"]
+    elif sys.platform == "darwin":
+        backends = ["pynput.keyboard._darwin", "pynput.mouse._darwin"]
+    else:
+        backends = ["pynput.keyboard._win32", "pynput.mouse._win32"]
+    for module in backends:
+        pyinstaller_command[-1:-1] = ["--hidden-import", module]
+
     try:
         # Remove previous build directories
         if os.path.exists('dist'):
-            os.system("rmdir /s /q dist")
+            shutil.rmtree('dist', ignore_errors=True)
         if os.path.exists('build'):
-            os.system("rmdir /s /q build")
+            shutil.rmtree('build', ignore_errors=True)
         if os.path.exists('__pycache__'):
-            os.system("rmdir /s /q __pycache__")
+            shutil.rmtree('__pycache__', ignore_errors=True)
 
         # Run PyInstaller
         subprocess.run(pyinstaller_command, check=True)
@@ -90,9 +101,9 @@ def run_pyinstaller_build():
 
         # Clean up unnecessary files
         if os.path.exists('build'):
-            os.system("rmdir /s /q build")
+            shutil.rmtree('build', ignore_errors=True)
         if os.path.exists('__pycache__'):
-            os.system("rmdir /s /q __pycache__")
+            shutil.rmtree('__pycache__', ignore_errors=True)
 
         # No need to copy data files manually since they are included
         # in the executable using --add-data
